@@ -22,7 +22,12 @@ namespace eval ::dv {
     array set CFG {
         max_rate        15
         skip_shutdown   0
+        relay_not_fail  1
+        use_color       1
     }
+
+    variable TITLE    "Cisco IOS DHCP Hardening Verification"
+    variable LINKEDIN "LinkedIn : alisedighnezhad"
 
     variable CONTROLS {}
     variable FINDINGS {}
@@ -59,6 +64,27 @@ proc ::dv::rep {ch n} {
     set s ""
     for {set i 0} {$i < $n} {incr i} {append s $ch}
     return $s
+}
+
+# ANSI colour helper. Set CFG(use_color) 0 if your terminal prints raw escape codes.
+proc ::dv::clr {style text} {
+    variable CFG
+    if {!$CFG(use_color)} {return $text}
+    switch -exact -- $style {
+        PASS    {set code "1;32"}
+        FAIL    {set code "1;31"}
+        WARNING {set code "1;33"}
+        HINT    {set code "1;36"}
+        ERROR   {set code "1;35"}
+        N/A     {set code "37"}
+        TITLE   {set code "1;96"}
+        LINK    {set code "94"}
+        BOLD    {set code "1"}
+        DIM     {set code "90"}
+        default {return $text}
+    }
+    set esc [format %c 27]
+    return "${esc}\[${code}m${text}${esc}\[0m"
 }
 
 proc ::dv::rank {s} {
@@ -410,6 +436,7 @@ proc ::dv::dhcp_bindings {} {
 
 proc ::dv::ctl_dhcp01 {} {
     variable IFORDER
+    variable CFG
     set pools {}
     foreach l [g_all {^ip dhcp pool \S+}] {
         if {[regexp {^ip dhcp pool (\S+)} $l _m nm]} {lappend pools $nm}
@@ -456,7 +483,11 @@ proc ::dv::ctl_dhcp01 {} {
         } elseif {$state == "disabled"} {
             add PASS "No DHCP Server configured and the DHCP service is disabled."
         } elseif {$state == "enabled"} {
-            add FAIL "No DHCP Server configured but the DHCP service is still enabled."
+            if {[llength $relay] > 0 && $CFG(relay_not_fail)} {
+                add WARNING "No DHCP Server configured and service dhcp is enabled, but DHCP relay (ip helper-address) is in use on [llength $relay] interface(s). 'no service dhcp' would also disable the relay agent, so this is not reported as FAIL."
+            } else {
+                add FAIL "No DHCP Server configured but the DHCP service is still enabled."
+            }
         } else {
             add ERROR "Cannot determine whether \"service dhcp\" is enabled: no explicit line in running-config and \"show running-config all\" did not resolve it."
         }
@@ -478,8 +509,10 @@ proc ::dv::ctl_dhcp02 {} {
     if {$globalOn} {
         if {$SN(global) == "disabled"} {
             add ERROR "Inconsistent evidence: running-config contains \"ip dhcp snooping\" but \"show ip dhcp snooping\" reports snooping disabled."
+        } elseif {$SN(global) == "enabled"} {
+            add PASS "DHCP Snooping is enabled globally (running-config and operational state agree)."
         } else {
-            add PASS "DHCP Snooping is enabled globally."
+            add ERROR "\"ip dhcp snooping\" is present in running-config but the operational state could not be confirmed (\"show ip dhcp snooping\" unavailable or unparsable)."
         }
         ev "running-config: ip dhcp snooping"
     } else {
@@ -693,10 +726,8 @@ proc ::dv::ctl_dhcp06 {} {
         if {[regexp -nocase $rx $t _m v]} {scan $v %d v; set n($key) $v} else {set n($key) ""}
     }
     set parsed 0
-    set succ 0
-    set fail 0
-    foreach k {st sr sw} {if {[string length $n($k)] > 0} {incr succ $n($k); set parsed 1}}
-    foreach k {ft fr fw} {if {[string length $n($k)] > 0} {incr fail $n($k); set parsed 1}}
+    foreach k {st ft sr fr sw fw} {if {[string length $n($k)] > 0} {set parsed 1}}
+    foreach k {st ft sr fr sw fw} {if {[string length $n($k)] == 0} {set n($k) 0}}
     set reason ""
     regexp -nocase {Last Failed Reason\s*:\s*([^\n]+)} $t _m reason
     set reason [string trim $reason]
@@ -704,12 +735,18 @@ proc ::dv::ctl_dhcp06 {} {
 
     if {!$parsed} {
         add PASS "Database is configured; agent statistics could not be parsed, accessibility not confirmed."
-    } elseif {$fail > 0 && $succ == 0} {
-        add WARNING "Database is configured but the agent reports only failures (failed: $fail). Last failure reason: $reason"
-    } elseif {$succ > 0} {
-        add PASS "Database is configured and the agent reports successful transfers (successful: $succ, failed: $fail)."
+        return
+    }
+    ev "Agent counters - Transfers: ok=$n(st) failed=$n(ft) | Reads: ok=$n(sr) failed=$n(fr) | Writes: ok=$n(sw) failed=$n(fw)"
+    if {$n(fw) > 0 || $n(ft) > 0} {
+        add WARNING "Database is configured but the agent reports failed writes/transfers (writes failed: $n(fw), transfers failed: $n(ft)); binding persistence is not reliable. Last failure reason: $reason"
+    } elseif {$n(sw) > 0} {
+        add PASS "Database is configured and writes succeed (successful writes: $n(sw), no failed writes/transfers)."
     } else {
-        add PASS "Database is configured; no transfer attempted yet, accessibility not yet confirmed."
+        add PASS "Database is configured; no successful write recorded yet, so accessibility is not yet confirmed."
+    }
+    if {$n(fr) > 0} {
+        ev "Failed reads: $n(fr) (can be benign if no database file existed at startup; bindings may not have been restored after reload)."
     }
 }
 
@@ -745,11 +782,12 @@ proc ::dv::ctl_dhcp07 {} {
 #------------------------------------------------------------------------------
 proc ::dv::banner {} {
     variable HOSTNAME
-    puts [rep "=" 40]
-    puts "    CIS DHCP SECURITY VERIFICATION"
-    puts "    Made by Alisedighnezhad (for ios ) "
-    puts "         linkdin:alisedighnezhad       "
-    puts [rep "=" 40]
+    variable TITLE
+    variable LINKEDIN
+    puts [clr DIM [rep "=" 44]]
+    puts "  [clr TITLE $TITLE]"
+    puts "  [clr LINK $LINKEDIN]"
+    puts [clr DIM [rep "=" 44]]
     puts ""
     puts "Platform : Cisco IOS"
     puts "Module   : DHCP Hardening"
@@ -759,16 +797,16 @@ proc ::dv::banner {} {
 }
 
 proc ::dv::report_control {id title status findings} {
-    puts "\[$id\] $title"
-    puts "Status: $status"
+    puts "[clr BOLD "\[$id\]"] [clr BOLD $title]"
+    puts "Status: [clr $status $status]"
     foreach f $findings {
         set k [lindex $f 0]
         set t [lindex $f 1]
         set items [lindex $f 2]
         if {$k == "EVIDENCE"} {
-            puts "  Evidence: $t"
+            puts "  [clr DIM Evidence:] $t"
         } else {
-            puts "  \[$k\] $t"
+            puts "  [clr $k "\[$k\]"] $t"
         }
         foreach it $items {puts "    - $it"}
     }
@@ -813,27 +851,27 @@ proc ::dv::run_all {} {
 
 proc ::dv::summary {} {
     variable COUNT
-    puts [rep "=" 40]
-    puts "SUMMARY"
-    puts [rep "=" 40]
-    puts "PASS    : $COUNT(PASS)"
-    puts "FAIL    : $COUNT(FAIL)"
-    puts "WARNING : $COUNT(WARNING)"
-    puts "HINT    : $COUNT(HINT)"
-    puts "N/A     : $COUNT(N/A)"
-    puts "ERROR   : $COUNT(ERROR)"
+    puts [clr DIM [rep "=" 44]]
+    puts [clr BOLD "SUMMARY"]
+    puts [clr DIM [rep "=" 44]]
+    puts "[clr PASS "PASS    "]: $COUNT(PASS)"
+    puts "[clr FAIL "FAIL    "]: $COUNT(FAIL)"
+    puts "[clr WARNING "WARNING "]: $COUNT(WARNING)"
+    puts "[clr HINT "HINT    "]: $COUNT(HINT)"
+    puts "[clr N/A "N/A     "]: $COUNT(N/A)"
+    puts "[clr ERROR "ERROR   "]: $COUNT(ERROR)"
     puts ""
     if {$COUNT(FAIL) > 0} {
-        set o "NON-COMPLIANT"
+        set o [clr FAIL "NON-COMPLIANT"]
     } elseif {$COUNT(ERROR) > 0} {
-        set o "INCOMPLETE (verification errors)"
+        set o [clr ERROR "INCOMPLETE (verification errors)"]
     } elseif {$COUNT(WARNING) > 0} {
-        set o "COMPLIANT WITH WARNINGS"
+        set o [clr WARNING "COMPLIANT WITH WARNINGS"]
     } else {
-        set o "COMPLIANT"
+        set o [clr PASS "COMPLIANT"]
     }
     puts "Overall Status: $o"
-    puts [rep "=" 40]
+    puts [clr DIM [rep "=" 44]]
 }
 
 proc ::dv::main {} {
